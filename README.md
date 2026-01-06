@@ -1,13 +1,13 @@
 # Symphony
 Symphony contains multiple components for running turn-by-turn workloads like chatbots and agents.
-
+For more details for NSDI'26 Artifact Evaluation, please refer to the [AE_Review.md](AE_Review.md).
 ## Components
 
 - **Workload Generator**: A Python-based workload generator designed to simulate realistic multi-turn conversation workloads for LLM inference systems. This tool generates client sessions and sends requests to a scheduler via gRPC, modeling human-like typing and reading speeds.
 - **Scheduler**: A global gRPC server that receives requests from the workload generator and forwards them to the LLM inference system.
 - **Modified vLLM**: We have modified vLLM to support turn-by-turn workloads. It is added as a submodule
 
-- **Node Scheduler**: Each instance of serving engine has a node level scheduler that receives requests from the scheduler and forwards them to the LLM inference system. It is responsible for managing the requests and memory on a single node.
+- **Node Scheduler**: Each instance of serving engine has a node level scheduler that receives requests from the scheduler and forwards them to the LLM inference system.
 
 
 ## Workload Generator

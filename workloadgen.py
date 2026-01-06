@@ -8,6 +8,7 @@ import argparse
 from typing import Tuple
 from concurrent import futures
 
+import numpy as np
 import received_response
 
 
@@ -52,13 +53,24 @@ class WorkloadGen(object):
         self.future_request_time_to_send = (
             dict()
         )  # session ids -> next-request time to send mapping
+        
+        # Separate tracking for read and type times
+        self.future_request_read_time = dict()  # session ids -> read time
+        self.future_request_type_time = dict()  # session ids -> type time
+        self.advisory_sent = dict()  # session ids -> whether advisory was sent
+        
         # remove session ids which have sent last request
         self.last_request_dict = dict()  # session ids -> session ids
 
-        self.read_speed_char_ps = (
-            25  # read speed per second #TODO: Change to distribution
-        )
-        self.type_speed_char_ps = 6  # type speed #TODO: Change to distribution
+        # Distribution parameters for read and write speeds
+        self.read_speed_mean = 25  # characters per second
+        self.read_speed_std = 10
+        self.type_speed_mean = 6  # characters per second
+        self.type_speed_std = 2
+        
+        # Per-session speeds (sampled from distributions)
+        self.session_read_speeds = dict()  # session_id -> read speed
+        self.session_type_speeds = dict()  # session_id -> type speed
         # RPC channel stuff
         self.scheduler_ip = scheduler_ip
         self.scheduler_port = scheduler_port
@@ -87,6 +99,13 @@ class WorkloadGen(object):
                         # but will fix automatically in next round
                         continue
                     self.active_sessions[self.session_id_counter] = new_data
+                    # Sample read and type speeds for this session
+                    self.session_read_speeds[self.session_id_counter] = max(
+                        1.0, np.random.normal(self.read_speed_mean, self.read_speed_std)
+                    )
+                    self.session_type_speeds[self.session_id_counter] = max(
+                        1.0, np.random.normal(self.type_speed_mean, self.type_speed_std)
+                    )
                     new_session_ids_ready_to_send.append((self.session_id_counter, 1))
                     self.session_id_counter += 1
                     # all new clients are ready to send
@@ -99,13 +118,26 @@ class WorkloadGen(object):
                         del self.last_request_dict[sess_id_reponse]
                         # since last request the response recieved will not be updated
                         del self.future_request_recieved[sess_id_reponse]
+                        # Clean up session speeds
+                        del self.session_read_speeds[sess_id_reponse]
+                        del self.session_type_speeds[sess_id_reponse]
                     else:
                         new_session_ids_ready_to_send.append(
                             (response["session_id"], 2)
                         )
                 # We now have all possible request to send
                 self.update_time_to_next_req(new_session_ids_ready_to_send)
-                # find min time client
+                
+                # Check if any advisory requests need to be sent
+                # Advisory is sent after read time but before type time
+                current_time = time.time()
+                for sids in list(self.future_request_read_time.keys()):
+                    if sids not in self.advisory_sent and self.future_request_read_time[sids] <= 0:
+                        # Read time complete, send advisory request
+                        self._send_advisory_request(sids)
+                        self.advisory_sent[sids] = True
+                
+                # find min time client for actual request
                 min_time_client = min(
                     self.future_request_time_to_send,
                     key=self.future_request_time_to_send.get,
@@ -137,18 +169,51 @@ class WorkloadGen(object):
                 # remove the sent element
                 del self.future_request_to_send[min_time_client]
                 del self.future_request_time_to_send[min_time_client]
+                if min_time_client in self.future_request_read_time:
+                    del self.future_request_read_time[min_time_client]
+                if min_time_client in self.future_request_type_time:
+                    del self.future_request_type_time[min_time_client]
+                if min_time_client in self.advisory_sent:
+                    del self.advisory_sent[min_time_client]
 
         except KeyboardInterrupt:
             print("Exiting Server")
             self.server.stop(0)
 
+    def _send_advisory_request(self, session_id):
+        """
+        Send advisory request to scheduler indicating user has started typing
+        """
+        try:
+            type_time_remaining = self.future_request_type_time.get(session_id, 0)
+            advisory_data = datagen_pb2.JsonResponse()
+            advisory_data.response = json.dumps({
+                "session_id": session_id,
+                "request_type": "advisory",
+                "estimated_time_to_request": type_time_remaining,
+                "prompt": "",  # No prompt yet, user is still typing
+                "response": "",
+                "is_last": False
+            })
+            response = self.send_request_stub.InferRequest(advisory_data)
+            print(f"Advisory request sent for session {session_id}, ETA: {type_time_remaining:.2f}s")
+        except Exception as e:
+            print(f"Error sending advisory request for session {session_id}: {str(e)}")
+
     def subtract_time_dict(self, min_time):
         """
         Modify dictionary time
         """
-
         for key in self.future_request_time_to_send:
             self.future_request_time_to_send[key] -= min_time
+        
+        # Also subtract from read times for advisory tracking
+        for key in list(self.future_request_read_time.keys()):
+            self.future_request_read_time[key] -= min_time
+            if self.future_request_read_time[key] <= 0:
+                # Read time complete, can be removed after advisory sent
+                if key in self.advisory_sent:
+                    del self.future_request_read_time[key]
 
     def update_time_to_next_req(self, new_session_ids_ready_to_send):
         """
@@ -160,16 +225,16 @@ class WorkloadGen(object):
                 # first request
                 req_sent_to_infer = self.active_sessions[sids].pop(0)["value"]
                 response_rcvd_back = self.active_sessions[sids].pop(0)["value"]
-                time_to_type = len(req_sent_to_infer) / self.type_speed_char_ps
+                time_to_type = len(req_sent_to_infer) / self.session_type_speeds[sids]
                 time_to_read_response = 0  # nothing to read first request sent
 
             if req_type == 2:
                 # second request
                 req_sent_to_infer = self.active_sessions[sids].pop(0)["value"]
                 response_rcvd_back = self.active_sessions[sids].pop(0)["value"]
-                time_to_type = len(req_sent_to_infer) / self.type_speed_char_ps
+                time_to_type = len(req_sent_to_infer) / self.session_type_speeds[sids]
                 time_to_read_response = (
-                    len(self.future_request_recieved[sids]) / self.read_speed_char_ps
+                    len(self.future_request_recieved[sids]) / self.session_read_speeds[sids]
                 )
             if (
                 len(self.active_sessions[sids]) == 0
@@ -185,6 +250,11 @@ class WorkloadGen(object):
             self.future_request_recieved[sids] = response_rcvd_back
             # future request time
             self.future_request_time_to_send[sids] = total_time_to_next_req
+            # Track read and type times separately for advisory
+            self.future_request_read_time[sids] = time_to_read_response
+            self.future_request_type_time[sids] = time_to_type
+            if sids in self.advisory_sent:
+                del self.advisory_sent[sids]  # Reset for next request
             print("Time to next rq {}".format(self.future_request_time_to_send))
 
         if False:
@@ -193,7 +263,7 @@ class WorkloadGen(object):
                 if req_type == 1:
                     # first request
                     req_sent_to_infer = self.active_sessions[sids].pop(0)["value"]
-                    time_to_type = len(req_sent_to_infer) / self.type_speed_char_ps
+                    time_to_type = len(req_sent_to_infer) / self.session_type_speeds[sids]
                     time_to_read_response = 0  # nothing to read all request sent
                 if req_type == 2:
                     # continuing session
@@ -202,9 +272,9 @@ class WorkloadGen(object):
                         req_sent_to_infer = self.active_sessions[sids].pop(0)["value"]
                     else:
                         req_sent_to_infer = ""
-                    time_to_type = len(req_sent_to_infer) / self.type_speed_char_ps
+                    time_to_type = len(req_sent_to_infer) / self.session_type_speeds[sids]
                     time_to_read_response = (
-                        len(response_rcvd_back) / self.read_speed_char_ps
+                        len(response_rcvd_back) / self.session_read_speeds[sids]
                     )
 
                 if len(self.active_sessions[sids]) == 0:

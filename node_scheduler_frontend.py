@@ -38,9 +38,25 @@ class NodeSchedulerFrontend(node_scheduler_pb2_grpc.RecieveDecodeRequestServicer
     def AcceptRequest(self, request, context):
         """
         Accept Request which was send by Global Scheduler
+        Can be either actual inference request or advisory (predictive)
         """
         recieved_request = json.loads(request.response)
         session_id_rcv = recieved_request["session_id"]
+        
+        # Check if this is an advisory request
+        if recieved_request.get("request_type") == "advisory":
+            # Handle advisory - user has started typing
+            eta = recieved_request.get("estimated_time_to_request", 0)
+            print(f"Node received advisory for session {session_id_rcv}, ETA: {eta:.2f}s")
+            # TODO: Implement predictive actions:
+            # - Warm up KV cache if evicted
+            # - Reserve GPU memory
+            # - Pre-schedule in queue
+            return_request = datagen_pb2.JsonResponse()
+            return_request.response = json.dumps({"recieved": True, "type": "advisory"})
+            return return_request
+        
+        # Normal inference request handling
         recieved_request["req_id"] = self.request_id
         self.request_id_to_session_id_mapping[self.request_id] = session_id_rcv
         self.request_id += 1
@@ -74,6 +90,26 @@ class NodeSchedulerFrontend(node_scheduler_pb2_grpc.RecieveDecodeRequestServicer
         return_request.response = json.dumps(return_dict)
         self.global_scheduler_stub.FinishedRequest(return_request)
         return None
+
+    def GetStatus(self, request, context):
+        """
+        Return current status of this node scheduler
+        Called by global scheduler to get running requests and resource info
+        """
+        # Get list of running session IDs
+        running_sessions = list(self.request_id_to_session_id_mapping.values())
+        
+        # For now, return basic status - can be enhanced with actual vLLM metrics
+        status_dict = {
+            "running_requests": running_sessions,
+            "tokens_remaining": {},  # Can be populated from vLLM engine metrics
+            "free_memory_gb": 66.85,  # Placeholder - should query actual GPU memory
+            "completed_requests": []  # List of recently completed requests
+        }
+        
+        return_response = datagen_pb2.JsonResponse()
+        return_response.response = json.dumps(status_dict)
+        return return_response
 
 
 def start_server(scheduler_server: NodeSchedulerFrontend, reciever_port: str):

@@ -7,7 +7,9 @@ import queue
 import random
 import grpc
 import argparse
-from typing import Tuple
+import requests
+import threading
+from typing import Tuple, Dict, Any
 from collections import defaultdict
 from concurrent import futures
 
@@ -64,7 +66,16 @@ class LLMScheduler(object):
         self.queued_requests = {i: [] for i in range(8)}
 
         self.kv_cache_map = {}  # session id -> gpu map
-        self.per_server_throughput = 35  # num tokens/sec
+        
+        # vLLM server configuration
+        self.vllm_host = "localhost"
+        self.vllm_port = 8000
+        self.vllm_base_url = f"http://{self.vllm_host}:{self.vllm_port}/v1"
+        
+        # Track active vLLM requests
+        self.active_vllm_requests = {}  # session_id -> {thread, start_time, server_id}
+        self.completed_vllm_requests = []  # List of completed session_ids
+        self.vllm_lock = threading.Lock()
 
     def get_requests_and_schedule(self):
         """
@@ -117,7 +128,7 @@ class LLMScheduler(object):
                             server_id_to_schedule
                         ]
                         if free_memory_available > memory_required:
-                            # schedule it for run
+                            # schedule it for run - make actual vLLM call
                             self.server_req_dict[server_id_to_schedule].append(
                                 session_id
                             )
@@ -128,6 +139,9 @@ class LLMScheduler(object):
                             self.server_free_memory_available[
                                 server_id_to_schedule
                             ] -= memory_required
+                            
+                            # Make actual vLLM API call in background thread
+                            self._make_vllm_request_async(session_id, req, server_id_to_schedule)
 
                         else:
                             # can't schedule put in wait queue
@@ -160,6 +174,10 @@ class LLMScheduler(object):
                                 ] -= memory_required
 
                                 self.kv_cache_map[session_id] = server_id
+                                
+                                # Make actual vLLM API call in background thread
+                                self._make_vllm_request_async(session_id, req, server_id)
+                                
                                 server_found = True
                                 break
                         if not server_found:
@@ -176,82 +194,41 @@ class LLMScheduler(object):
                 # At the end of this
                 # either a req is running on a gpu updating k,v cache map
                 # req dict update and the tokens needed to process
-                time.sleep(1)  # sleep x amount time
-                end_scheduling_time = time.time()
-                sec_to_schedule_to_all_receieved_req = (
-                    end_scheduling_time - start_scheduling_time
-                )
-                start_scheduling_time = time.time()
-                # import ipdb
-
-                # ipdb.set_trace()
-                session_id_to_respond_back = list()
-                # the loop here equally divides the throughput
-                # removes finised request and counts them
-                # print(
-                # "Tokens remaining to process {}".format(
-                # self.server_req_dict_tokens_remaining
-                # )
-                # )
-                # print(
-                # "Tokens Remaining before {}".format(
-                # self.server_req_dict_tokens_remaining
-                # )
-                # )
-                # print("Server Status before {}".format(self.server_req_dict))
-
-                for server_id in self.server_req_dict_tokens_remaining:
-                    all_tokens = self.server_req_dict_tokens_remaining[server_id]
-                    if len(all_tokens) == 0:
-                        continue
-                    num_tokens_processed_per_request = (
-                        self.per_server_throughput / len(all_tokens)
-                    ) * sec_to_schedule_to_all_receieved_req  # multiply
-                    new_token_list = []
-                    request_to_remove = []
-                    for idx, tokens_remaining in enumerate(all_tokens):
-                        new_remaining_tokens = (
-                            tokens_remaining - num_tokens_processed_per_request
+                time.sleep(0.1)  # Short sleep to check for completed requests
+                
+                # Check for completed vLLM requests
+                session_id_to_respond_back = []
+                with self.vllm_lock:
+                    if self.completed_vllm_requests:
+                        session_id_to_respond_back = self.completed_vllm_requests.copy()
+                        self.completed_vllm_requests.clear()
+                
+                # Process completed requests
+                for session_id in session_id_to_respond_back:
+                    if session_id in self.active_vllm_requests:
+                        server_id = self.active_vllm_requests[session_id]['server_id']
+                        
+                        # Free memory
+                        num_tokens_freed_memory = self.active_session_lengths[session_id]
+                        self.server_free_memory_available[server_id] += (
+                            num_tokens_freed_memory * (1.1 / 1000)
                         )
-                        if new_remaining_tokens < 0:
-                            # request finished
-                            # marked of request to respond back
-                            # print("Removing index {}".format(idx))
-                            # import ipdb
-
-                            # ipdb.set_trace()
-                            # print(
-                            # "Removing {}".format(
-                            # self.server_req_dict[server_id][idx]
-                            # )
-                            # )
-                            # import ipdb
-
-                            # ipdb.set_trace()
-                            session_id_to_respond_back.append(
-                                self.server_req_dict[server_id][idx]
-                            )  # finished
-                            # free memory for finished token
-                            num_tokens_freed_memory = self.active_session_lengths[
-                                self.server_req_dict[server_id][idx]
-                            ]
-                            self.server_free_memory_available[server_id] += (
-                                num_tokens_freed_memory
-                            ) * (1.1 / 1000)
-
-                            # remove the session id from running list
-                            request_to_remove.append(idx)
-
-                        else:
-                            new_token_list.append(new_remaining_tokens)
-                    print("Request to remove {}".format(request_to_remove))
-                    for req_remove in sorted(request_to_remove, reverse=True):
-                        # import ipdb
-
-                        # ipdb.set_trace()
-                        del self.server_req_dict[server_id][req_remove]
-                    # update remaining tokens
-                    self.server_req_dict_tokens_remaining[server_id] = new_token_list
+                        
+                        # Remove from active requests
+                        if session_id in self.server_req_dict[server_id]:
+                            self.server_req_dict[server_id].remove(session_id)
+                        if session_id in self.active_vllm_requests:
+                            del self.active_vllm_requests[session_id]
+                        
+                        # Remove from tokens remaining tracking
+                        # Find and remove from server_req_dict_tokens_remaining
+                        try:
+                            idx = [i for i, sid in enumerate(self.server_req_dict[server_id]) 
+                                   if sid == session_id]
+                            if idx:
+                                del self.server_req_dict_tokens_remaining[server_id][idx[0]]
+                        except (ValueError, IndexError):
+                            pass
                 # print(
                 # "Tokens Remaining after {}".format(
                 # self.server_req_dict_tokens_remaining
@@ -284,6 +261,10 @@ class LLMScheduler(object):
                             self.server_req_dict_tokens_remaining[server_id].append(
                                 self.active_session_lengths[sreq]
                             )
+                            
+                            # Make actual vLLM API call for the queued request
+                            req_info = self.active_request_dict[sreq]
+                            self._make_vllm_request_async(sreq, req_info, server_id)
                         else:
                             break  # server not having memory, # this maintains fifo order
                     # remove scheduled requests from wait queue
@@ -312,6 +293,68 @@ class LLMScheduler(object):
             print("Exiting Server")
             self.channel.close()
             self.server.stop(0)
+
+    def _make_vllm_request_async(self, session_id: int, req: Dict[str, Any], server_id: int):
+        """
+        Make async vLLM API request in a background thread
+        """
+        thread = threading.Thread(
+            target=self._call_vllm_api,
+            args=(session_id, req, server_id),
+            daemon=True
+        )
+        
+        with self.vllm_lock:
+            self.active_vllm_requests[session_id] = {
+                'thread': thread,
+                'start_time': time.time(),
+                'server_id': server_id
+            }
+        
+        thread.start()
+    
+    def _call_vllm_api(self, session_id: int, req: Dict[str, Any], server_id: int):
+        """
+        Make actual HTTP call to vLLM server
+        """
+        try:
+            prompt = req.get('prompt', '')
+            
+            # Prepare the request for vLLM OpenAI-compatible API
+            payload = {
+                "model": "default",  # vLLM will use the loaded model
+                "prompt": prompt,
+                "max_tokens": 2048,
+                "temperature": 0.7,
+                "stream": False
+            }
+            
+            # Make the request to vLLM
+            response = requests.post(
+                f"{self.vllm_base_url}/completions",
+                json=payload,
+                timeout=300  # 5 minute timeout
+            )
+            
+            if response.status_code == 200:
+                print(f"vLLM request completed for session {session_id}")
+                # Mark as completed
+                with self.vllm_lock:
+                    self.completed_vllm_requests.append(session_id)
+            else:
+                print(f"vLLM request failed for session {session_id}: {response.status_code}")
+                # Still mark as completed to free resources
+                with self.vllm_lock:
+                    self.completed_vllm_requests.append(session_id)
+                    
+        except requests.exceptions.Timeout:
+            print(f"vLLM request timeout for session {session_id}")
+            with self.vllm_lock:
+                self.completed_vllm_requests.append(session_id)
+        except Exception as e:
+            print(f"vLLM request error for session {session_id}: {str(e)}")
+            with self.vllm_lock:
+                self.completed_vllm_requests.append(session_id)
 
 
 def parse_args(parser):
