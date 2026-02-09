@@ -1,0 +1,6 @@
+syntax = "proto3";
+import "datagen.proto";
+
+service RecieveDecodeRequest{
+	rpc AcceptRequest(JsonResponse) returns (JsonResponse) {}
+}
