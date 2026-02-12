@@ -26,12 +26,8 @@ To run this single request version.
 * docker run --gpus all -it --rm --ipc=host --network=host --ulimit stack=67108864  codebedouin/symphony
 * start two more screen 
 * docker exec -it containerName bash
-* Launch following scripts
-* python3 -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Llama-2-7b-chat-hf \
-    --port 8000 \
-    --gpu-memory-utilization 0.3
-
+* Launch following scripts, first switch your current directory to symphony by running - cd symphony
+* python3 -m vllm.entrypoints.openai.api_server --model meta-llama/Llama-2-7b-chat-hf  --port 8000  --gpu-memory-utilization 0.3
 * python scheduler_queue_each_server.py
 * python workloadgen.py
 
