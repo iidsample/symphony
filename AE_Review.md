@@ -17,6 +17,28 @@ Major Changes
 (iii) Scheduler: This is our global scheduler. It is responsible for load-based scheduling and integrating with vLLM.
 
 
+## Running single AE 
+Based on the AE's request, we have created a single request GPU version of Symphony.
+To run this single request version.
+
+* docker pull codebedouin/symphony
+* Start a terminal multiplexera like tmux/screen
+* docker run --gpus all -it --rm --ipc=host --network=host --ulimit stack=67108864  codebedouin/symphony
+* start two more screen 
+* docker exec -it containerName bash
+* Launch following scripts
+* python3 -m vllm.entrypoints.openai.api_server \
+    --model meta-llama/Llama-2-7b-chat-hf \
+    --port 8000 \
+    --gpu-memory-utilization 0.3
+
+* python scheduler_queue_each_server.py
+* python workloadgen.py
+
+Please let us know if this works out. 
+The above set of sequences run symphony on 100 requests. All the files are dependencies are pre-installed in the docker container.
+
+
 ## Badges 
 We are unable to provide resources to run the artifacts due to resource constraints.
 We are attempting to achieve the following badges:
